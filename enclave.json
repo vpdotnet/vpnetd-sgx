@@ -1,0 +1,22 @@
+{
+  "debug": false,
+  "exe": "vpnetd-sgx",
+  "files": [
+    {
+      "source": "/etc/ssl/certs/ca-certificates.crt",
+      "target": "/etc/ssl/certs/ca-certificates.crt"
+    }
+  ],
+  "heapSize": 300,
+  "key": "private.pem",
+  "mounts": [
+    {
+      "readOnly": false,
+      "source": "/var/run/vpnet",
+      "target": "/var/run/vpnet",
+      "type": "hostfs"
+    }
+  ],
+  "productID": 1,
+  "securityVersion": 1
+}
