@@ -58,7 +58,7 @@ func (om *ObfuscationManager) ProcessOutgoingPacket(sessionID SessionKey, data [
 		return nil
 	}
 
-	// TODO where is the obfuscation here?
+	// Send outgoing packet to a different connection than it came from, some time in the future
 	nextConn := om.vpnEnclave.connectionManager.GetNextConnection()
 	if nextConn == nil {
 		// drop silently

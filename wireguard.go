@@ -53,9 +53,6 @@ const (
 	RejectAfterTime        = 180 * time.Second
 	DEFAULT_LOAD_THRESHOLD = 100 // Threshold for considering server under load
 
-	// Replay protection
-	WINDOW_SIZE = 2048
-
 	NoisePublicKeySize    = 32
 	NoisePrivateKeySize   = 32
 	NoisePresharedKeySize = 32
@@ -219,14 +216,6 @@ type Keypair struct {
 type cipher interface {
 	Seal(dst, nonce, plaintext, additionalData []byte) []byte
 	Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
-}
-
-// SlidingWindow implements replay protection
-type SlidingWindow struct {
-	bitmap      [WINDOW_SIZE / 64]uint64
-	lastCounter uint64
-	mutex       sync.Mutex
-	initialized bool // Add this new field
 }
 
 // CookieChecker for MAC verification
@@ -807,9 +796,7 @@ func (wg *WireGuardHandler) ProcessDataPacket(data []byte, peerKey [32]byte) ([]
 	binary.LittleEndian.PutUint64(nonce[4:], counter)
 
 	// Check for replay
-	keypair.replayFilter.mutex.Lock()
 	isReplay := keypair.replayFilter.CheckReplay(counter)
-	keypair.replayFilter.mutex.Unlock()
 
 	if isReplay {
 		return nil, fmt.Errorf("replay detected for counter: %d", counter)
@@ -1100,86 +1087,6 @@ func (wg *WireGuardHandler) IsUnderLoad() bool {
 	wg.loadMutex.RLock()
 	defer wg.loadMutex.RUnlock()
 	return wg.underLoad
-}
-
-// CheckReplay checks if a packet is a replay
-func (sw *SlidingWindow) CheckReplay(counter uint64) bool {
-	// Note: Mutex should be locked by the caller
-
-	// Special handling for first packet after Reset
-	if !sw.initialized {
-		sw.lastCounter = counter
-		sw.initialized = true
-		return false
-	}
-
-	// If counter is too old, it's a replay
-	if counter < sw.lastCounter && sw.lastCounter-counter > WINDOW_SIZE {
-		return true
-	}
-
-	// If counter is newer than last seen, update window
-	if counter > sw.lastCounter {
-		// Calculate how many bits to shift
-		diff := counter - sw.lastCounter
-
-		// For large jumps, just clear the bitmap
-		if diff >= WINDOW_SIZE {
-			for i := range sw.bitmap {
-				sw.bitmap[i] = 0
-			}
-		} else {
-			// Implementation of bitmap shifting...
-			// This is complex, so for now we'll just clear the bitmap
-			// for simplicity in this fix
-			for i := range sw.bitmap {
-				sw.bitmap[i] = 0
-			}
-		}
-
-		// Update last counter
-		sw.lastCounter = counter
-		return false
-	}
-
-	// Counter is within window, check bitmap
-	if counter == sw.lastCounter {
-		return false // Accept duplicate of lastCounter for WireGuard compatibility
-	}
-
-	// Counter is within window, check bitmap
-	diff := sw.lastCounter - counter
-	wordIndex := diff / 64
-
-	// Add bounds checking to prevent index out of range panic
-	if wordIndex >= uint64(len(sw.bitmap)) {
-		// If the index would be out of bounds, treat as a replay
-		return true
-	}
-
-	bitIndex := diff % 64
-
-	// Check if bit is already set
-	mask := uint64(1) << bitIndex
-	if (sw.bitmap[wordIndex] & mask) != 0 {
-		return true
-	}
-
-	// Set bit for this counter
-	sw.bitmap[wordIndex] |= mask
-	return false
-}
-
-// Reset resets the sliding window
-func (sw *SlidingWindow) Reset() {
-	sw.mutex.Lock()
-	defer sw.mutex.Unlock()
-
-	for i := range sw.bitmap {
-		sw.bitmap[i] = 0
-	}
-	sw.lastCounter = 0
-	sw.initialized = false // Mark as not initialized
 }
 
 // CheckMAC1 checks the MAC1 of a message

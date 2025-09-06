@@ -13,8 +13,10 @@ type SessionKey struct {
 	Port uint16
 }
 
+// String returns a string representation of the SessionKey
 func (s SessionKey) String() string {
-	return fmt.Sprintf("%s:%d", net.IP(s.IP[:]), s.Port)
+	ip := net.IP(s.IP[:])
+	return fmt.Sprintf("%s:%d", ip.String(), s.Port)
 }
 
 // IdentityVault manages session IDs, virtual IPs, and encryption keys
