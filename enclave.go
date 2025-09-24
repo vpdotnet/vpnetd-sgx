@@ -195,9 +195,6 @@ func (e *VPNEnclave) ProcessEncryptedPacket(sessionID SessionKey, remoteAddr *ne
 		response, clientPublicKey, err := e.wireGuardHandler.ProcessHandshakeInitiation(encryptedData, remoteAddr)
 		if err != nil {
 			atomic.AddUint64(&e.stats.errorCount, 1)
-			slog.Error("Error processing handshake",
-				"remoteAddr", remoteAddr,
-				"error", err)
 			return fmt.Errorf("handshake processing failed: %v", err)
 		}
 

@@ -146,7 +146,7 @@ func (tp *TrafficProcessor) HandleWireGuardEncryptedData(sessionID string, data 
 		packetType := data[0]
 
 		switch packetType {
-		case WG_MESSAGE_DATA: // Data packet
+		case MessageTransportType: // Data packet
 			// For WireGuard data packets, process directly with WireGuard handler
 			plaintext, err := tp.wireGuardHandler.ProcessDataPacket(data, sessionInfo.PeerPublicKey)
 			if err != nil {
@@ -155,12 +155,12 @@ func (tp *TrafficProcessor) HandleWireGuardEncryptedData(sessionID string, data 
 
 			// Process immediately
 			return tp.HandleTUNToClientPacket(plaintext, conn)
-		case WG_MESSAGE_HANDSHAKE_RESPONSE:
+		case MessageResponseType:
 			// Client sending a handshake response
 			// This is unusual as the server is normally the one sending responses
 			return fmt.Errorf("unexpected handshake response from client")
 
-		case WG_MESSAGE_COOKIE:
+		case MessageCookieReplyType:
 			// Cookie message (for DoS mitigation)
 			// We don't process these yet
 			return fmt.Errorf("cookie messages not yet supported")

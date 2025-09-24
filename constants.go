@@ -8,24 +8,16 @@ import (
 
 // WireGuard protocol constants
 const (
-	// Protocol construction
+	// WireGuard message types
+	MessageInitiationType  = 1
+	MessageResponseType    = 2
+	MessageCookieReplyType = 3
+	MessageTransportType   = 4
 
-	// Message types - Used in your main.go file
-	WG_MESSAGE_HANDSHAKE_INITIATION = 1
-	WG_MESSAGE_HANDSHAKE_RESPONSE   = 2
-	WG_MESSAGE_COOKIE               = 3
-	WG_MESSAGE_DATA                 = 4
-
-	// Control packet types - Used in your main.go
+	// Control packet types
 	ControlTypeKeepAlive  = 0x01
 	ControlTypeDisconnect = 0x02
 	ControlTypeRotateKeys = 0x03
-
-	// Message types from wireguard.go
-	MessageInitiationType  uint32 = 1
-	MessageResponseType    uint32 = 2
-	MessageCookieReplyType uint32 = 3
-	MessageTransportType   uint32 = 4
 
 	// Message response size
 	MessageResponseSize = 92 // Size of handshake response message

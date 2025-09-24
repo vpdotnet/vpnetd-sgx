@@ -194,6 +194,15 @@ func (km *KeyManager) IsAuthorizedPeer(peerPubKey [32]byte) bool {
 	return true
 }
 
+// AddPeer adds a peer to the authorized list
+func (km *KeyManager) AddPeer(peerPubKey [32]byte, peerInfo *PeerInfo) {
+	km.peerKeysMutex.Lock()
+	defer km.peerKeysMutex.Unlock()
+
+	km.peerKeys[peerPubKey] = peerInfo
+	slog.Debug("Added peer", "description", peerInfo.Description)
+}
+
 // AddAuthorizedPeer adds a peer's public key to the authorized list
 // This is called when the host approves an unknown peer via WireguardAddPeer
 func (km *KeyManager) AddAuthorizedPeer(peerPubKey [32]byte) {
