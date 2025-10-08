@@ -251,7 +251,7 @@ func (e *VPNEnclave) wgAddKeyHandler(rw http.ResponseWriter, req *http.Request) 
 	resData["server_key"] = keyResp.PeerPublicKey
 	resData["description"] = keyResp.Description
 	resData["dns_servers"] = []string{"10.0.0.243"}
-	resData["dns_servers_adblock"] = []string{"10.0.0.243"}
+	resData["dns_servers_adblock"] = []string{"10.0.0.241"}
 
 	if keyResp.PresharedKey != "" {
 		resData["preshared_key"] = keyResp.PresharedKey
