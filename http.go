@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -18,10 +20,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/edgelesssys/ego/enclave"
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // GET https://<wg_server_ip>:<wg_port>/addKey
@@ -69,13 +72,63 @@ func (e *VPNEnclave) StartWgHttpServer() error {
 		slog.Info("Certificate written to PEM file", "path", "/var/run/vpnet/http.pem")
 	}
 
+	sgxCert := &tls.Certificate{
+		Certificate: [][]byte{cert},
+		PrivateKey:  priv,
+	}
+
+	// setup for autocert (limited to whitelisted hosts)
+	localHosts := getLocalHosts()
+	hostWhiteList := make(map[string]bool)
+	for _, h := range localHosts {
+		hostWhiteList[h] = true
+	}
+
+	automgr := &autocert.Manager{
+		// no cache, certificate will need to be re-generated if enclave restarts
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(localHosts...),
+	}
+
+	var fallback http.Handler
+	if len(localHosts) > 0 {
+		fallback = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != "GET" && r.Method != "HEAD" {
+				http.Error(w, "Use HTTPS", http.StatusBadRequest)
+				return
+			}
+			target := "https://" + localHosts[0] + r.URL.RequestURI()
+			http.Redirect(w, r, target, http.StatusFound)
+		})
+	}
+
+	// create a simple http server on port 80 that will respond to autocert auth requests and redirect to https
+	httpServer := &http.Server{
+		Addr:    ":80",
+		Handler: automgr.HTTPHandler(fallback),
+	}
+	go httpServer.ListenAndServe()
+
+	// prepare tls config handling h2 and getcertificate
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{
-			{
-				Certificate: [][]byte{cert},
-				PrivateKey:  priv,
-			},
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if hello.ServerName == "WG" {
+				return sgxCert, nil
+			}
+			if len(hello.SupportedProtos) == 1 && hello.SupportedProtos[0] == acme.ALPNProto {
+				// this is a verification request
+				return automgr.GetCertificate(hello)
+			}
+			if _, found := hostWhiteList[hello.ServerName]; found {
+				// whitelisted hostname
+				return automgr.GetCertificate(hello)
+			}
+			// fallback to sgx certificate
+			return sgxCert, nil
+
 		},
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1", acme.ALPNProto},
 	}
 
 	// listen on port WireguardPort
@@ -87,9 +140,15 @@ func (e *VPNEnclave) StartWgHttpServer() error {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/addKey", e.wgAddKeyHandler)
-	mux.HandleFunc("/stats", e.statsHandler)
+	mux.HandleFunc("/pubkey", e.wgGetServerKey) // endpoint to get the server's public key
 
-	return http.Serve(s, mux)
+	srv := &http.Server{
+		Addr:      ":" + strconv.Itoa(WireguardPort),
+		Handler:   mux,
+		TLSConfig: tlsConfig,
+	}
+
+	return srv.Serve(s)
 }
 
 // Helper function to send JSON responses
@@ -106,26 +165,10 @@ func sendJSONResponse(rw http.ResponseWriter, data interface{}) {
 	rw.Write(buf)
 }
 
-// statsHandler provides statistics about the enclave via HTTP
-func (e *VPNEnclave) statsHandler(rw http.ResponseWriter, req *http.Request) {
-	// Get stats from various components
-	stats := map[string]interface{}{
-		"sessions_count":         e.identityVault.GetSessionCount(),
-		"handshakes_processed":   atomic.LoadUint64(&e.stats.handshakesProcessed),
-		"data_packets_processed": atomic.LoadUint64(&e.stats.dataPacketsProcessed),
-		"errors":                 atomic.LoadUint64(&e.stats.errorCount),
-		"packets_processed":      e.trafficProcessor.GetStatsPacketsProcessed(),
-		"bytes_processed":        e.trafficProcessor.GetStatsBytesProcessed(),
-		"timestamp":              time.Now().UnixNano() / int64(time.Millisecond),
-	}
-
-	rw.Header().Set("Content-Type", "application/json")
+func (e *VPNEnclave) wgGetServerKey(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Set("Content-Type", "text/plain")
 	rw.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-	json.NewEncoder(rw).Encode(stats)
-}
-
-type TokenInfo struct {
-	Exp int64 `json:"exp"` // expiration time as unix timestamp
+	rw.Write([]byte(base64.StdEncoding.EncodeToString(e.keyManager.publicKey[:])))
 }
 
 func (e *VPNEnclave) wgAddKeyHandler(rw http.ResponseWriter, req *http.Request) {
@@ -143,17 +186,32 @@ func (e *VPNEnclave) wgAddKeyHandler(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	// check validity of token
-	// https://vp.net/_rest/Network/VPN/Token:check?token=19a2c63c397231fd9f8ee94b5444b63e357d7d7f17f98586
-	// TODO need to move token verification so we instead make that a call to the local peer
-	info, err := PostApi[TokenInfo]("Network/VPN/Token:check", map[string]any{"token": pt})
+	// Verify token or pubkey with parent process
+	var expiration int64
+	var err error
+
+	if pt == "pubkey" {
+		// Use pubkey verification
+		expiration, err = e.verifyPeerPubkey(pubkey)
+	} else {
+		// Use token verification
+		expiration, err = e.verifyPeerToken(pt)
+	}
+
 	if err != nil {
-		slog.Error("Failed to check token", "error", err)
+		slog.Error("Failed to verify peer", "error", err)
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// check expiration
-	if info.Exp < Now().Unix() {
+
+	// Check if token/pubkey is valid (expiration != 0)
+	if expiration == 0 {
+		http.Error(rw, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
+	// Check expiration
+	if expiration < Now().Unix() {
 		http.Error(rw, "Subscription has expired", http.StatusPaymentRequired)
 		return
 	}
@@ -193,6 +251,7 @@ func (e *VPNEnclave) wgAddKeyHandler(rw http.ResponseWriter, req *http.Request) 
 	resData["server_key"] = keyResp.PeerPublicKey
 	resData["description"] = keyResp.Description
 	resData["dns_servers"] = []string{"10.0.0.243"}
+	resData["dns_servers_adblock"] = []string{"10.0.0.243"}
 
 	if keyResp.PresharedKey != "" {
 		resData["preshared_key"] = keyResp.PresharedKey
@@ -306,4 +365,92 @@ func getPrimaryIP() net.IP {
 		}
 	}
 	return nil
+}
+
+// verifyPeerToken sends a token verification request to the parent process
+// and waits up to 30 seconds for a response.
+// Returns the expiration timestamp (or 0 if invalid).
+func (e *VPNEnclave) verifyPeerToken(token string) (int64, error) {
+	// Get a response handler
+	reqID, respChan := getResponseHandler()
+	defer sendResponseToHandler(reqID, nil)
+
+	// Build reqID as big endian
+	reqIDbe := make([]byte, 8)
+	binary.BigEndian.PutUint64(reqIDbe, reqID)
+
+	// Send to parent process
+	conn := e.connectionManager.GetNextConnection()
+	if conn == nil {
+		return 0, fmt.Errorf("no parent connection available")
+	}
+
+	if err := conn.Send(ReqPeerVerifyToken, reqIDbe, []byte(token)); err != nil {
+		return 0, fmt.Errorf("failed to send verify token request: %w", err)
+	}
+
+	// Wait up to 30 seconds for response
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	select {
+	case response := <-respChan:
+		// Parse response: <8 bytes expiration timestamp bigendian>
+		if len(response) != 8 {
+			return 0, fmt.Errorf("invalid response length: %d", len(response))
+		}
+		expiration := int64(binary.BigEndian.Uint64(response[0:8]))
+		return expiration, nil
+	case <-ctx.Done():
+		return 0, fmt.Errorf("timeout waiting for token verification response")
+	}
+}
+
+// verifyPeerPubkey sends a pubkey verification request to the parent process
+// and waits up to 30 seconds for a response.
+// Returns the expiration timestamp (or 0 if invalid).
+func (e *VPNEnclave) verifyPeerPubkey(pubkeyB64 string) (int64, error) {
+	// Decode the base64 pubkey
+	pubkeyBytes, err := base64.StdEncoding.DecodeString(pubkeyB64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to decode pubkey: %w", err)
+	}
+
+	if len(pubkeyBytes) != 32 {
+		return 0, fmt.Errorf("invalid pubkey length: %d", len(pubkeyBytes))
+	}
+
+	// Get a response handler
+	reqID, respChan := getResponseHandler()
+	defer sendResponseToHandler(reqID, nil)
+
+	// Build reqID as big endian
+	reqIDbe := make([]byte, 8)
+	binary.BigEndian.PutUint64(reqIDbe, reqID)
+
+	// Send to parent process
+	conn := e.connectionManager.GetNextConnection()
+	if conn == nil {
+		return 0, fmt.Errorf("no parent connection available")
+	}
+
+	if err := conn.Send(ReqPeerVerifyPubkey, reqIDbe, pubkeyBytes); err != nil {
+		return 0, fmt.Errorf("failed to send verify pubkey request: %w", err)
+	}
+
+	// Wait up to 30 seconds for response
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	select {
+	case response := <-respChan:
+		// Parse response: <8 bytes expiration timestamp bigendian>
+		if len(response) != 8 {
+			return 0, fmt.Errorf("invalid response length: %d", len(response))
+		}
+		expiration := int64(binary.BigEndian.Uint64(response[0:8]))
+		return expiration, nil
+	case <-ctx.Done():
+		return 0, fmt.Errorf("timeout waiting for pubkey verification response")
+	}
 }

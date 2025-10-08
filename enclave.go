@@ -526,6 +526,11 @@ func (e *VPNEnclave) StartConnectionReader(conn *IPC, connIndex int) {
 			if err := e.wireGuardHandler.ProcessWireguardAddPeer(buf, conn); err != nil {
 				slog.Error("Failed to process WireguardAddPeer", "error", err)
 			}
+		case RespPeerVerifyToken, RespPeerVerifyPubkey:
+			// Handle response for peer verification
+			if err := e.ProcessPeerVerifyResponse(cmd, buf); err != nil {
+				slog.Error("Failed to process peer verify response", "error", err, "cmd", fmt.Sprintf("0x%04x", cmd))
+			}
 		default:
 			slog.Error("Unhandled command on connection",
 				"command", fmt.Sprintf("0x%04x", cmd),
@@ -538,6 +543,26 @@ func (e *VPNEnclave) StartConnectionReader(conn *IPC, connIndex int) {
 func (e *VPNEnclave) RemoveConnection(conn *IPC) error {
 	// Remove the connection from the connection manager
 	e.connectionManager.RemoveConnection(conn)
+
+	return nil
+}
+
+// ProcessPeerVerifyResponse handles responses for peer verification requests
+func (e *VPNEnclave) ProcessPeerVerifyResponse(cmd uint16, data []byte) error {
+	// Parse reqID from first 8 bytes
+	if len(data) < 8 {
+		return fmt.Errorf("peer verify response too short: %d bytes", len(data))
+	}
+
+	reqID := binary.BigEndian.Uint64(data[0:8])
+
+	// Extract the response data (everything after reqID)
+	responseData := data[8:]
+
+	// Send to the waiting channel
+	if !sendResponseToHandler(reqID, responseData) {
+		slog.Warn("Received response for unknown request ID", "reqID", reqID, "cmd", fmt.Sprintf("0x%04x", cmd))
+	}
 
 	return nil
 }

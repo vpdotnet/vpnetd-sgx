@@ -32,9 +32,6 @@ This process ensures that:
 
 - Linux
 - Docker
-- Go 1.21 or later
-- Intel SGX SDK and PSW
-- EGo (Edgeless Go) framework
 
 ### Build Instructions
 
