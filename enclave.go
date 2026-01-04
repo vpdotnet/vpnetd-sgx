@@ -99,7 +99,7 @@ func NewVPNEnclave() (*VPNEnclave, error) {
 
 		var memStat runtime.MemStats
 
-		for _ = range maintenanceTicker.C {
+		for range maintenanceTicker.C {
 			runtime.ReadMemStats(&memStat)
 			e.wireGuardHandler.Maintenance()
 			slog.Info("Maintenance performed",

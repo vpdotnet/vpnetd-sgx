@@ -16,7 +16,6 @@ import (
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
-	"golang.org/x/crypto/poly1305"
 
 	"golang.zx2c4.com/wireguard/tai64n"
 )
@@ -32,12 +31,12 @@ const (
 	WGIdentifier      = "WireGuard v1 zx2c4 Jason@zx2c4.com"
 
 	// Message sizes
-	MessageInitiationSize      = 148                                           // size of handshake initiation message
-	MessageCookieReplySize     = 64                                            // size of cookie reply message
-	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
-	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
-	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
-	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake related message
+	MessageInitiationSize      = 148                                                    // size of handshake initiation message
+	MessageCookieReplySize     = 64                                                     // size of cookie reply message
+	MessageTransportHeaderSize = 16                                                     // size of data preceding content in transport message
+	MessageTransportSize       = MessageTransportHeaderSize + chacha20poly1305.Overhead // size of empty transport
+	MessageKeepaliveSize       = MessageTransportSize                                   // size of keepalive
+	MessageHandshakeSize       = MessageInitiationSize                                  // size of largest handshake related message
 
 	// Transport message offsets
 	MessageTransportOffsetReceiver = 4
@@ -64,8 +63,8 @@ type MessageInitiation struct {
 	Type      uint32
 	Sender    uint32
 	Ephemeral [NoisePublicKeySize]byte
-	Static    [NoisePublicKeySize + poly1305.TagSize]byte
-	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte
+	Static    [NoisePublicKeySize + chacha20poly1305.Overhead]byte
+	Timestamp [tai64n.TimestampSize + chacha20poly1305.Overhead]byte
 	MAC1      [blake2s.Size128]byte
 	MAC2      [blake2s.Size128]byte
 }
@@ -76,7 +75,7 @@ type MessageResponse struct {
 	Sender    uint32
 	Receiver  uint32
 	Ephemeral [NoisePublicKeySize]byte
-	Empty     [poly1305.TagSize]byte
+	Empty     [chacha20poly1305.Overhead]byte
 	MAC1      [blake2s.Size128]byte
 	MAC2      [blake2s.Size128]byte
 }
@@ -94,7 +93,7 @@ type MessageCookieReply struct {
 	Type     uint32
 	Receiver uint32
 	Nonce    [chacha20poly1305.NonceSizeX]byte
-	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+	Cookie   [blake2s.Size128 + chacha20poly1305.Overhead]byte
 }
 
 // Handshake state enumeration
@@ -148,7 +147,6 @@ type WireGuardHandler struct {
 	handshakes      map[uint32]*Handshake
 	handshakesMutex sync.RWMutex
 	indexMap        map[uint32]time.Time
-	indexMapMutex   sync.RWMutex
 
 	// Keypair tracking
 	keypairs      map[uint32]*Keypair
@@ -172,29 +170,22 @@ type WireGuardHandler struct {
 
 // Handshake represents the state of a WireGuard handshake
 type Handshake struct {
-	state                     handshakeState
-	mutex                     sync.RWMutex
-	hash                      [blake2s.Size]byte
-	chainKey                  [blake2s.Size]byte
-	presharedKey              NoisePresharedKey
-	localEphemeral            NoisePrivateKey
-	localIndex                uint32
-	remoteIndex               uint32
-	remoteStatic              NoisePublicKey
-	remoteEphemeral           NoisePublicKey
-	precomputedStaticStatic   [NoisePublicKeySize]byte
-	lastTimestamp             tai64n.Timestamp
-	lastInitiationConsumption time.Time
-	lastSentHandshake         time.Time
+	state                   handshakeState
+	hash                    [blake2s.Size]byte
+	chainKey                [blake2s.Size]byte
+	localEphemeral          NoisePrivateKey
+	localIndex              uint32
+	remoteIndex             uint32
+	remoteStatic            NoisePublicKey
+	remoteEphemeral         NoisePublicKey
+	precomputedStaticStatic [NoisePublicKeySize]byte
 }
 
 // Session represents a peer session
 type Session struct {
-	handshake      Handshake
 	keypairCurrent *Keypair
 	keypairPrev    *Keypair
 	keypairNext    *Keypair
-	remoteAddr     string
 	lastReceived   time.Time
 	lastSent       time.Time
 	peerKey        [32]byte
@@ -569,12 +560,12 @@ func (wg *WireGuardHandler) ProcessHandshakeInitiation(data []byte, remoteAddr *
 	emptyData := aead.Seal(nil, ZeroNonce[:], emptyMsg, handshake.hash[:])
 
 	// Set encrypted empty in response
-	if len(emptyData) != poly1305.TagSize {
+	if len(emptyData) != chacha20poly1305.Overhead {
 		slog.Error("Invalid empty data size",
 			"size", len(emptyData),
-			"expected", poly1305.TagSize)
+			"expected", chacha20poly1305.Overhead)
 		return nil, emptyKey, fmt.Errorf("invalid empty data size: %d, expected %d",
-			len(emptyData), poly1305.TagSize)
+			len(emptyData), chacha20poly1305.Overhead)
 	}
 
 	copy(respMsg.Empty[:], emptyData)
@@ -852,7 +843,7 @@ func (wg *WireGuardHandler) EncryptDataPacket(data []byte, peerKey [32]byte, rec
 	// Increment counter for this specific peer
 	// TODO replace with atomic operations
 	wg.countersMutex.Lock()
-	counter, _ := wg.peerCounters[peerKey]
+	counter := wg.peerCounters[peerKey]
 	counter++
 	wg.peerCounters[peerKey] = counter
 	wg.countersMutex.Unlock()
@@ -864,12 +855,13 @@ func (wg *WireGuardHandler) EncryptDataPacket(data []byte, peerKey [32]byte, rec
 
 	// Get buffer from pool for result
 	// Estimate size needed - plaintext size + headers + authentication tag
-	resultSize := len(data) + MessageTransportHeaderSize + poly1305.TagSize
+	resultSize := len(data) + MessageTransportHeaderSize + chacha20poly1305.Overhead
 	resultBuffer := wg.packetPool.Get().([]byte)
 
 	// Check if buffer is large enough
 	if cap(resultBuffer) < resultSize {
 		// Return the buffer and allocate a new one
+		//lint:ignore SA6002 Using []byte in pool is acceptable here
 		wg.packetPool.Put(resultBuffer)
 		resultBuffer = make([]byte, resultSize)
 	}
