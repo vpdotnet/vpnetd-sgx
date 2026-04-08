@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 // Protocol constants are defined in protocol.go
 
-const ipcWriteBufSize = 16 * 1024 // 16KB write buffer
+const ipcWriteBufSize = 256 * 1024 // 256KB write buffer
 
 type IPC struct {
 	conn net.Conn
@@ -43,11 +44,35 @@ func (ipc *IPC) Send(cmd uint16, bufs ...[]byte) error {
 
 	ipc.mu.Lock()
 
-	// Wait if buffer full
+	// Wait if buffer full — if nobody is flushing, become the flusher.
 	for ipc.pending+packetSize > ipcWriteBufSize {
 		if !ipc.flushing {
+			// Nobody is flushing; flush the current buffer to make room.
+			ipc.flushing = true
+			flushBuf := ipc.active
+			toWrite := ipc.pending
+			ipc.active = 1 - ipc.active
+			ipc.pending = 0
 			ipc.mu.Unlock()
-			return fmt.Errorf("IPC buffer full")
+
+			data := ipc.bufs[flushBuf][:toWrite]
+			for len(data) > 0 {
+				n, err := ipc.writeWithDeadline(data)
+				if err != nil {
+					ipc.conn.Close()
+					ipc.mu.Lock()
+					ipc.flushing = false
+					ipc.cond.Broadcast()
+					ipc.mu.Unlock()
+					return err
+				}
+				data = data[n:]
+			}
+
+			ipc.mu.Lock()
+			ipc.flushing = false
+			ipc.cond.Broadcast()
+			continue
 		}
 		ipc.cond.Wait()
 	}
@@ -105,6 +130,19 @@ func (ipc *IPC) Send(cmd uint16, bufs ...[]byte) error {
 	ipc.cond.Broadcast()
 	ipc.mu.Unlock()
 	return nil
+}
+
+// ipcWriteTimeout is the maximum time a single conn.Write call may block.
+// If the host stops reading from the socket, this prevents the enclave from
+// freezing with all goroutines blocked on IPC writes.
+const ipcWriteTimeout = 5 * time.Second
+
+// writeWithDeadline sets a per-write deadline before calling conn.Write.
+func (ipc *IPC) writeWithDeadline(data []byte) (int, error) {
+	if c, ok := ipc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		c.SetWriteDeadline(time.Now().Add(ipcWriteTimeout))
+	}
+	return ipc.conn.Write(data)
 }
 
 func varintLen(x uint64) int {

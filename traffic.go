@@ -52,13 +52,8 @@ func (tp *TrafficProcessor) HandleTUNToClientPacket(packet []byte, conn *IPC) er
 	// them to the appropriate WireGuard client
 	processedPacket, session, ok := tp.vpnEnclave.natTable.HandleInboundPacket(packet)
 	if !ok {
-		// NAT rejected the packet, drop it
 		return nil
 	}
-
-	// IP extraction after NAT removed as debug logging was removed for performance in hot path
-
-	// Detailed NAT routing logging removed for performance in hot path
 
 	return tp.vpnEnclave.SendToSessionKey(processedPacket, session)
 }
@@ -70,38 +65,21 @@ func (tp *TrafficProcessor) HandleClientToTUNPacket(packet []byte, sess SessionK
 	atomic.AddUint64(&tp.stats.packetsProcessed, 1)
 	atomic.AddUint64(&tp.stats.bytesProcessed, uint64(len(packet)))
 
-	// IP extraction removed as debug logging was removed for performance in hot path
-
-	// Debug logging removed for performance in hot path
-
-	// Check if this packet should be ignored (e.g., link-local IPv6)
 	if tp.shouldIgnorePacket(packet) {
-		// Packet ignored, debug logging removed for performance
 		return nil
 	}
 
-	// Process packet through NAT
-	// For outbound packets (WireGuard clients → Internet), we use HandleOutboundPacket
-	// to translate client's private IP to a masquerade IP
+	// Translate client's private IP to masquerade IP via NAT.
 	processedPacket, ok := tp.vpnEnclave.natTable.HandleOutboundPacket(packet, sess)
 	if !ok {
-		// NAT processing failed or packet was dropped
 		return nil
 	}
 
-	// NAT transformation logging removed for performance in hot path
-
-	// Use processed packet after NAT
-	packet = processedPacket
-
-	// For outbound packets (WireGuard clients → Internet), we send directly to TUN (Internet)
-	// This completely bypasses the routing engine to avoid "no route found" errors
 	nextConn := tp.vpnEnclave.connectionManager.GetNextConnection()
 	if nextConn == nil {
-		// drop silently if no connection available
 		return nil
 	}
-	return nextConn.sendToTUN(packet)
+	return nextConn.sendToTUN(processedPacket)
 }
 
 // shouldIgnorePacket determines if a packet should be ignored based on IP addresses

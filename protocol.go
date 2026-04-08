@@ -24,4 +24,8 @@ const (
 	// Peer verification (pubkey-based)
 	ReqPeerVerifyPubkey  uint16 = 0x0204 // (enclave to host) verify peer by pubkey. <0x0204> <8 bytes reqID bigendian> <32 bytes pubkey binary>
 	RespPeerVerifyPubkey uint16 = 0x0205 // (host to enclave) response to verify pubkey. <0x0205> <8 bytes reqID bigendian> <8 bytes expiration unix timestamp bigendian, 0 if invalid>
+
+	// Server info
+	ReqServerPubkey  uint16 = 0x0300 // (host to enclave) request server's WireGuard public key
+	RespServerPubkey uint16 = 0x0301 // (enclave to host) response with 32-byte public key
 )

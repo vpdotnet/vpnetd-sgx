@@ -133,7 +133,6 @@ func (e *VPNEnclave) SendToSessionKey(packet []byte, sessionID SessionKey) error
 	if e.obfuscationManager != nil {
 		return e.obfuscationManager.ProcessOutgoingPacket(sessionID, packet)
 	} else {
-		// Add detailed diagnostic logging
 		if sessionInfo.RemoteAddr == nil {
 			slog.Error("Cannot send packet to session: RemoteAddr is nil")
 			return fmt.Errorf("remote address is nil for session %v", sessionID)
@@ -268,7 +267,6 @@ func (e *VPNEnclave) ProcessEncryptedPacket(sessionID SessionKey, remoteAddr *ne
 		plaintext, err := e.wireGuardHandler.ProcessDataPacket(encryptedData, sessionInfo.PeerPublicKey)
 		if err != nil {
 			atomic.AddUint64(&e.stats.errorCount, 1)
-			slog.Error("Failed to process data packet", "error", err)
 			return fmt.Errorf("failed to process data packet: %v", err)
 		}
 
@@ -276,7 +274,6 @@ func (e *VPNEnclave) ProcessEncryptedPacket(sessionID SessionKey, remoteAddr *ne
 		if len(plaintext) > 0 && plaintext[0] == PacketTypeControl {
 			// This is a control packet, handle it with the control packet processor
 			if len(plaintext) > 1 {
-				slog.Debug("Received control packet from client")
 				return e.processControlPacket(sessionID, plaintext[1:])
 			}
 			slog.Error("Received control packet that is too short")
@@ -284,7 +281,6 @@ func (e *VPNEnclave) ProcessEncryptedPacket(sessionID SessionKey, remoteAddr *ne
 		}
 
 		// Forward the decrypted packet directly to the TUN device
-		// Use HandleClientToTUNPacket to bypass routing engine and send directly to TUN
 		if err := e.trafficProcessor.HandleClientToTUNPacket(plaintext, sessionInfo.SessionID); err != nil {
 			atomic.AddUint64(&e.stats.errorCount, 1)
 			slog.Error("Failed to forward decrypted packet to TUN", "error", err)
@@ -498,6 +494,15 @@ func (e *VPNEnclave) StartConnectionReader(conn *IPC, connIndex int) {
 			return
 		}
 
+		// Cap payload length to prevent OOM from malformed frames.
+		const maxIPCPayload = 64 * 1024
+		if ln > maxIPCPayload {
+			slog.Error("IPC payload too large, closing connection",
+				"connIndex", connIndex,
+				"length", ln)
+			return
+		}
+
 		var buf []byte
 		if ln > 0 {
 			if ln <= ReusableBufferSize {
@@ -526,11 +531,49 @@ func (e *VPNEnclave) StartConnectionReader(conn *IPC, connIndex int) {
 			if err := e.wireGuardHandler.ProcessWireguardAddPeer(buf, conn); err != nil {
 				slog.Error("Failed to process WireguardAddPeer", "error", err)
 			}
+			// If the AddPeer included a deferred handshake (len > 50), create
+			// the session so subsequent data packets can be processed.
+			if len(buf) >= 50 {
+				var publicKey [32]byte
+				copy(publicKey[:], buf[:32])
+				addrBytes := buf[32:50]
+				ip := make(net.IP, 16)
+				copy(ip, addrBytes[:16])
+				if ip4 := ip.To4(); ip4 != nil {
+					ip = ip4
+				}
+				port := binary.BigEndian.Uint16(addrBytes[16:18])
+				remoteAddr := &net.UDPAddr{IP: slices.Clone(ip), Port: int(port)}
+
+				var sessionID SessionKey
+				copy(sessionID.IP[:], ip.To16())
+				sessionID.Port = uint16(port)
+
+				if !e.identityVault.IsSessionValid(sessionID) {
+					if err := e.identityVault.CreateSession(sessionID, remoteAddr); err != nil {
+						slog.Error("Failed to create session for AddPeer", "error", err)
+					}
+				}
+				e.identityVault.UpdateSessionPeerKey(sessionID, publicKey)
+				e.identityVault.MarkSessionEstablished(sessionID)
+				// Store the client's sender index from the handshake
+				if len(buf) >= 58 { // 32 + 18 + 8 (at least type + sender index)
+					handshakeData := buf[50:]
+					if len(handshakeData) >= 8 {
+						clientSenderIdx := binary.LittleEndian.Uint32(handshakeData[4:8])
+						e.identityVault.UpdateSessionRemoteIndex(sessionID, clientSenderIdx)
+					}
+				}
+			}
 		case RespPeerVerifyToken, RespPeerVerifyPubkey:
 			// Handle response for peer verification
 			if err := e.ProcessPeerVerifyResponse(cmd, buf); err != nil {
 				slog.Error("Failed to process peer verify response", "error", err, "cmd", fmt.Sprintf("0x%04x", cmd))
 			}
+		case ReqServerPubkey:
+			// Respond with server's WireGuard public key
+			pubkey := e.keyManager.GetServerPublicKey()
+			conn.Send(RespServerPubkey, pubkey[:])
 		default:
 			slog.Error("Unhandled command on connection",
 				"command", fmt.Sprintf("0x%04x", cmd),
